@@ -1,4 +1,4 @@
-// Vercel serverless function. Keys stay server-side: ANTHROPIC_API_KEY (required), ANTHROPIC_MODEL (optional).
+// Vercel serverless function. Keep GEMINI_API_KEY on the server; optional GEMINI_MODEL overrides the model.
 const MAX_LEN = 8000;
 const hits = new Map(); // best-effort per-instance rate limit
 const norm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
@@ -29,8 +29,8 @@ function clean(parsed, source) {
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST.' });
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return res.status(503).json({ error: 'AI is not configured on the server.' });
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return res.status(503).json({ error: 'AI is not configured on the server. Add GEMINI_API_KEY in Vercel Environment Variables.' });
   const ip = String(req.headers['x-forwarded-for'] || 'x').split(',')[0];
   const now = Date.now(), recent = (hits.get(ip) || []).filter((t) => now - t < 60000);
   if (recent.length >= 8) return res.status(429).json({ error: 'Too many requests. Wait a minute.' });
@@ -41,26 +41,31 @@ export default async function handler(req, res) {
   if (text.length > MAX_LEN) return res.status(413).json({ error: `Text is over ${MAX_LEN} characters.` });
   const lang = language === 'hi' ? 'Hindi' : 'English';
   const style = level === 'bullets' ? 'short bullet-style fragments' : 'very simple sentences';
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 25000);
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', signal: ctl.signal,
-      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      signal: ctl.signal,
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
       body: JSON.stringify({
-        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5-5', max_tokens: 1800, system: SYSTEM,
-        messages: [{ role: 'user', content: `Write the "text" fields in ${lang}, using ${style}. Keep "quote" exactly as in the notice.\n\n<notice>\n${text}\n</notice>` }]
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ role: 'user', parts: [{ text: `Write the "text" fields in ${lang}, using ${style}. Keep "quote" exactly as in the notice.\n\n<notice>\n${text}\n</notice>` }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1800, responseMimeType: 'application/json' }
       })
     });
-    if (r.status === 429) return res.status(429).json({ error: 'AI provider rate limit reached.' });
-    if (!r.ok) return res.status(502).json({ error: `AI provider error (${r.status}).` });
-    const raw = (await r.json()).content?.map((c) => c.text || '').join('') || '';
-    const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
+    if (r.status === 429) return res.status(429).json({ error: 'Gemini free-tier rate limit reached. Wait a little and try again.' });
+    if (!r.ok) return res.status(502).json({ error: `Gemini API error (${r.status}). Check the API key, model and AI Studio quota.` });
+    const data = await r.json();
+    const raw = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
     let parsed;
-    try { parsed = JSON.parse(raw.slice(a, b + 1)); } catch { return res.status(502).json({ error: 'AI returned malformed output.' }); }
+    try { parsed = JSON.parse(raw); } catch { return res.status(502).json({ error: 'Gemini returned malformed output.' }); }
     return res.status(200).json(clean(parsed, text));
   } catch (e) {
-    return res.status(e.name === 'AbortError' ? 504 : 502).json({ error: e.name === 'AbortError' ? 'AI request timed out.' : 'AI request failed.' });
-  } finally { clearTimeout(timer); } // note: document text is never logged
+    return res.status(e.name === 'AbortError' ? 504 : 502).json({ error: e.name === 'AbortError' ? 'AI request timed out.' : 'Gemini API request failed.' });
+  } finally {
+    clearTimeout(timer); // notice text is never logged
+  }
 }
